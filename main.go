@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"text/tabwriter"
 
@@ -88,6 +87,35 @@ func apiRequest(method, path string, body interface{}) ([]byte, error) {
 	}
 
 	return respBody, nil
+}
+
+// resolveTicket finds a ticket by db id ("1") or code ("TST-1")
+// returns the db id and the display name
+func resolveTicket(arg string) (int, string, error) {
+	data, err := apiRequest("GET", "/api/tickets", nil)
+	if err != nil {
+		return 0, "", err
+	}
+	var tickets []map[string]interface{}
+	json.Unmarshal(data, &tickets)
+
+	for _, t := range tickets {
+		dbID := int(t["id"].(float64))
+		idStr := fmt.Sprintf("%d", dbID)
+
+		// build CODE-NUM display name
+		display := idStr
+		if p, ok := t["project"].(map[string]interface{}); ok {
+			if num, ok := t["ticket_number"].(float64); ok {
+				display = fmt.Sprintf("%s-%.0f", p["acronym"], num)
+			}
+		}
+
+		if idStr == arg || strings.EqualFold(display, arg) {
+			return dbID, display, nil
+		}
+	}
+	return 0, "", fmt.Errorf("ticket %s not found", arg)
 }
 
 func main() {
@@ -288,10 +316,14 @@ func main() {
 	// --- ticket (detail) ---
 	ticketCmd := &cobra.Command{
 		Use:   "ticket [id]",
-		Short: "show ticket details",
+		Short: "show ticket details (accepts TST-1 or db id)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// fetch all tickets and find by id (no single-ticket endpoint)
+			dbID, _, err := resolveTicket(args[0])
+			if err != nil {
+				return err
+			}
+
 			data, err := apiRequest("GET", "/api/tickets", nil)
 			if err != nil {
 				return err
@@ -300,17 +332,16 @@ func main() {
 			json.Unmarshal(data, &tickets)
 
 			for _, t := range tickets {
-				id := fmt.Sprintf("%.0f", t["id"].(float64))
-				if id == args[0] {
-					ticket := id
+				if int(t["id"].(float64)) == dbID {
+					display := fmt.Sprintf("%d", dbID)
 					if p, ok := t["project"].(map[string]interface{}); ok {
 						if num, ok := t["ticket_number"].(float64); ok {
-							ticket = fmt.Sprintf("%s-%.0f", p["acronym"], num)
+							display = fmt.Sprintf("%s-%.0f", p["acronym"], num)
 						}
-						fmt.Printf("ticket:      %s\n", ticket)
+						fmt.Printf("ticket:      %s\n", display)
 						fmt.Printf("project:     %s (%s)\n", p["name"], p["acronym"])
 					} else {
-						fmt.Printf("ticket:      %s\n", ticket)
+						fmt.Printf("ticket:      %s\n", display)
 					}
 					fmt.Printf("title:       %s\n", t["title"])
 					fmt.Printf("status:      %s\n", t["column"])
@@ -329,19 +360,19 @@ func main() {
 					return nil
 				}
 			}
-			return fmt.Errorf("ticket %s not found", args[0])
+			return fmt.Errorf("ticket not found")
 		},
 	}
 
 	// --- move ---
 	moveCmd := &cobra.Command{
 		Use:   "move [id] [status]",
-		Short: "update ticket status (todo, inprogress, testing, done)",
+		Short: "update ticket status (accepts TST-1 or db id)",
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			id, err := strconv.Atoi(args[0])
+			dbID, display, err := resolveTicket(args[0])
 			if err != nil {
-				return fmt.Errorf("invalid ticket id")
+				return err
 			}
 			column := strings.ToLower(args[1])
 			valid := map[string]bool{"todo": true, "inprogress": true, "testing": true, "done": true}
@@ -349,12 +380,12 @@ func main() {
 				return fmt.Errorf("invalid status: %s (use: todo, inprogress, testing, done)", column)
 			}
 
-			path := fmt.Sprintf("/api/tickets/%d", id)
+			path := fmt.Sprintf("/api/tickets/%d", dbID)
 			_, err = apiRequest("PATCH", path, map[string]string{"column": column})
 			if err != nil {
 				return err
 			}
-			fmt.Printf("ticket %d → %s\n", id, column)
+			fmt.Printf("%s → %s\n", display, column)
 			return nil
 		},
 	}

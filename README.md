@@ -37,13 +37,15 @@ waiboard tickets -p TST                        # filter by project code
 waiboard tickets -s todo                       # filter by status
 waiboard tickets -p TST -s inprogress          # both
 waiboard tickets -m                            # only assigned to you
-waiboard ticket 42                             # ticket detail
-waiboard move 42 inprogress                    # change ticket status
+waiboard ticket TST-1                          # ticket detail
+waiboard move TST-1 inprogress                 # change ticket status
 waiboard new -p TST "fix the login bug"        # create a ticket
 waiboard new -p TST -d "details here" "title"  # create with description
 waiboard whoami                                # show current user
 waiboard logout                                # clear saved credentials
 ```
+
+tickets display as `TST-1`, `TST-2`, etc. — each project starts numbering at 1. you can use `TST-1` or the db id `1` anywhere a ticket id is needed.
 
 ## statuses
 
