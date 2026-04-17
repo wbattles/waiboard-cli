@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"text/tabwriter"
 
@@ -89,8 +90,36 @@ func apiRequest(method, path string, body interface{}) ([]byte, error) {
 	return respBody, nil
 }
 
-// resolveTicket finds a ticket by db id ("1") or code ("TST-1")
-// returns the db id and the display name
+func currentUsername() (string, error) {
+	data, err := apiRequest("GET", "/api/current-user", nil)
+	if err != nil {
+		return "", err
+	}
+
+	var user map[string]interface{}
+	json.Unmarshal(data, &user)
+
+	username, ok := user["username"].(string)
+	if !ok || username == "" {
+		return "", fmt.Errorf("could not determine current user")
+	}
+
+	return username, nil
+}
+
+func publicTicketID(t map[string]interface{}) string {
+	if p, ok := t["project"].(map[string]interface{}); ok {
+		if acronym, ok := p["acronym"].(string); ok {
+			if num, ok := t["ticket_number"].(float64); ok {
+				return fmt.Sprintf("%s-%.0f", acronym, num)
+			}
+		}
+	}
+	return ""
+}
+
+// resolveTicket finds a ticket by code ("TST-1")
+// returns the internal id and the public display name
 func resolveTicket(arg string) (int, string, error) {
 	data, err := apiRequest("GET", "/api/tickets", nil)
 	if err != nil {
@@ -101,21 +130,98 @@ func resolveTicket(arg string) (int, string, error) {
 
 	for _, t := range tickets {
 		dbID := int(t["id"].(float64))
-		idStr := fmt.Sprintf("%d", dbID)
+		display := publicTicketID(t)
 
-		// build CODE-NUM display name
-		display := idStr
-		if p, ok := t["project"].(map[string]interface{}); ok {
-			if num, ok := t["ticket_number"].(float64); ok {
-				display = fmt.Sprintf("%s-%.0f", p["acronym"], num)
-			}
-		}
-
-		if idStr == arg || strings.EqualFold(display, arg) {
+		if strings.EqualFold(display, arg) {
 			return dbID, display, nil
 		}
 	}
 	return 0, "", fmt.Errorf("ticket %s not found", arg)
+}
+
+func ticketSortParts(t map[string]interface{}) (string, int, int) {
+	project := ""
+	if p, ok := t["project"].(map[string]interface{}); ok {
+		if acronym, ok := p["acronym"].(string); ok {
+			project = acronym
+		}
+	}
+
+	number := 0
+	if n, ok := t["ticket_number"].(float64); ok {
+		number = int(n)
+	}
+
+	id := 0
+	if n, ok := t["id"].(float64); ok {
+		id = int(n)
+	}
+
+	return project, number, id
+}
+
+func getTicketByID(dbID int) (map[string]interface{}, error) {
+	data, err := apiRequest("GET", "/api/tickets", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var tickets []map[string]interface{}
+	json.Unmarshal(data, &tickets)
+
+	for _, t := range tickets {
+		if int(t["id"].(float64)) == dbID {
+			return t, nil
+		}
+	}
+
+	return nil, fmt.Errorf("ticket not found")
+}
+
+func resolveProjectUserID(projectID int, username string) (int, string, error) {
+	path := fmt.Sprintf("/api/projects/%d/users", projectID)
+	data, err := apiRequest("GET", path, nil)
+	if err != nil {
+		return 0, "", err
+	}
+
+	var users []map[string]interface{}
+	json.Unmarshal(data, &users)
+
+	for _, u := range users {
+		if strings.EqualFold(u["username"].(string), username) {
+			return int(u["id"].(float64)), u["username"].(string), nil
+		}
+	}
+
+	return 0, "", fmt.Errorf("user '%s' not found in this project", username)
+}
+
+func resolveProjectID(arg string) (int, string, string, error) {
+	data, err := apiRequest("GET", "/api/projects", nil)
+	if err != nil {
+		return 0, "", "", err
+	}
+
+	var projects []map[string]interface{}
+	json.Unmarshal(data, &projects)
+
+	for _, p := range projects {
+		id := int(p["id"].(float64))
+		name := p["name"].(string)
+		acronym := p["acronym"].(string)
+
+		if strings.EqualFold(acronym, arg) || strings.EqualFold(name, arg) {
+			return id, name, acronym, nil
+		}
+	}
+
+	return 0, "", "", fmt.Errorf("project '%s' not found", arg)
+}
+
+func isValidStatus(column string) bool {
+	valid := map[string]bool{"todo": true, "inprogress": true, "testing": true, "done": true}
+	return valid[column]
 }
 
 func main() {
@@ -130,19 +236,23 @@ func main() {
 		Short: "save connection details",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			url, _ := cmd.Flags().GetString("url")
-			user, _ := cmd.Flags().GetString("user")
 			key, _ := cmd.Flags().GetString("key")
 
-			cfg := &Config{URL: url, User: user, ApiKey: key}
+			cfg := &Config{URL: url, ApiKey: key}
 			if err := saveConfig(cfg); err != nil {
 				return err
 			}
 
 			// verify connection
-			_, err := apiRequest("GET", "/api/current-user", nil)
+			username, err := currentUsername()
 			if err != nil {
 				os.Remove(configPath())
 				return fmt.Errorf("login failed: %v", err)
+			}
+
+			cfg.User = username
+			if err := saveConfig(cfg); err != nil {
+				return err
 			}
 
 			fmt.Println("logged in")
@@ -150,10 +260,8 @@ func main() {
 		},
 	}
 	loginCmd.Flags().String("url", "", "server url (e.g. https://board.example.com)")
-	loginCmd.Flags().String("user", "", "username")
 	loginCmd.Flags().String("key", "", "api key")
 	loginCmd.MarkFlagRequired("url")
-	loginCmd.MarkFlagRequired("user")
 	loginCmd.MarkFlagRequired("key")
 
 	// --- logout ---
@@ -219,32 +327,21 @@ func main() {
 	ticketsCmd := &cobra.Command{
 		Use:   "tickets",
 		Short: "list tickets",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			project, _ := cmd.Flags().GetString("project")
 			status, _ := cmd.Flags().GetString("status")
 			mine, _ := cmd.Flags().GetBool("mine")
+			showDesc, _ := cmd.Flags().GetBool("desc")
 
 			// resolve project code to id
 			path := "/api/tickets"
 			if project != "" {
-				projects, err := apiRequest("GET", "/api/projects", nil)
+				projectID, _, _, err := resolveProjectID(project)
 				if err != nil {
 					return err
 				}
-				var projectList []map[string]interface{}
-				json.Unmarshal(projects, &projectList)
-
-				var projectID float64
-				for _, p := range projectList {
-					if strings.EqualFold(p["acronym"].(string), project) {
-						projectID = p["id"].(float64)
-						break
-					}
-				}
-				if projectID == 0 {
-					return fmt.Errorf("project '%s' not found", project)
-				}
-				path = fmt.Sprintf("/api/tickets?project_id=%.0f", projectID)
+				path = fmt.Sprintf("/api/tickets?project_id=%d", projectID)
 			}
 
 			data, err := apiRequest("GET", path, nil)
@@ -267,11 +364,14 @@ func main() {
 
 			// filter by mine
 			if mine {
-				cfg, _ := loadConfig()
+				username, err := currentUsername()
+				if err != nil {
+					return err
+				}
 				var filtered []map[string]interface{}
 				for _, t := range tickets {
 					if au, ok := t["assigned_user"].(map[string]interface{}); ok {
-						if au["username"] == cfg.User {
+						if au["username"] == username {
 							filtered = append(filtered, t)
 						}
 					}
@@ -284,15 +384,37 @@ func main() {
 				return nil
 			}
 
+			sort.Slice(tickets, func(i, j int) bool {
+				projectI, numberI, idI := ticketSortParts(tickets[i])
+				projectJ, numberJ, idJ := ticketSortParts(tickets[j])
+
+				if projectI != projectJ {
+					return projectI < projectJ
+				}
+				if numberI != numberJ {
+					return numberI < numberJ
+				}
+				return idI < idJ
+			})
+
 			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-			fmt.Fprintln(w, "ticket\tstatus\tassigned\ttitle")
-			fmt.Fprintln(w, "------\t------\t--------\t-----")
+			if showDesc && mine {
+				fmt.Fprintln(w, "ticket\tstatus\ttitle\tdescription")
+				fmt.Fprintln(w, "------\t------\t-----\t-----------")
+			} else if showDesc {
+				fmt.Fprintln(w, "ticket\tstatus\tassigned\ttitle\tdescription")
+				fmt.Fprintln(w, "------\t------\t--------\t-----\t-----------")
+			} else if mine {
+				fmt.Fprintln(w, "ticket\tstatus\ttitle")
+				fmt.Fprintln(w, "------\t------\t-----")
+			} else {
+				fmt.Fprintln(w, "ticket\tstatus\tassigned\ttitle")
+				fmt.Fprintln(w, "------\t------\t--------\t-----")
+			}
 			for _, t := range tickets {
-				ticket := fmt.Sprintf("%.0f", t["id"].(float64))
-				if p, ok := t["project"].(map[string]interface{}); ok {
-					if num, ok := t["ticket_number"].(float64); ok {
-						ticket = fmt.Sprintf("%s-%.0f", p["acronym"], num)
-					}
+				ticket := publicTicketID(t)
+				if ticket == "" {
+					ticket = "unknown"
 				}
 				col := t["column"].(string)
 				assigned := ""
@@ -303,20 +425,40 @@ func main() {
 				if len(title) > 40 {
 					title = title[:37] + "..."
 				}
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", ticket, col, assigned, title)
+				description := ""
+				if showDesc {
+					if d, ok := t["description"].(string); ok {
+						description = d
+					}
+					description = strings.ReplaceAll(description, "\n", " ")
+					description = strings.TrimSpace(description)
+					if len(description) > 60 {
+						description = description[:57] + "..."
+					}
+				}
+				if showDesc && mine {
+					fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", ticket, col, title, description)
+				} else if showDesc {
+					fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", ticket, col, assigned, title, description)
+				} else if mine {
+					fmt.Fprintf(w, "%s\t%s\t%s\n", ticket, col, title)
+				} else {
+					fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", ticket, col, assigned, title)
+				}
 			}
 			w.Flush()
 			return nil
 		},
 	}
-	ticketsCmd.Flags().StringP("project", "p", "", "filter by project code")
+	ticketsCmd.Flags().StringP("project", "p", "", "filter by project code or name")
 	ticketsCmd.Flags().StringP("status", "s", "", "filter by status (todo, inprogress, testing, done)")
 	ticketsCmd.Flags().BoolP("mine", "m", false, "show only tickets assigned to you")
+	ticketsCmd.Flags().Bool("desc", false, "show ticket descriptions")
 
 	// --- ticket (detail) ---
 	ticketCmd := &cobra.Command{
 		Use:   "ticket [id]",
-		Short: "show ticket details (accepts TST-1 or db id)",
+		Short: "show ticket details",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			dbID, _, err := resolveTicket(args[0])
@@ -324,50 +466,167 @@ func main() {
 				return err
 			}
 
-			data, err := apiRequest("GET", "/api/tickets", nil)
+			t, err := getTicketByID(dbID)
 			if err != nil {
 				return err
 			}
-			var tickets []map[string]interface{}
-			json.Unmarshal(data, &tickets)
 
-			for _, t := range tickets {
-				if int(t["id"].(float64)) == dbID {
-					display := fmt.Sprintf("%d", dbID)
-					if p, ok := t["project"].(map[string]interface{}); ok {
-						if num, ok := t["ticket_number"].(float64); ok {
-							display = fmt.Sprintf("%s-%.0f", p["acronym"], num)
-						}
-						fmt.Printf("ticket:      %s\n", display)
-						fmt.Printf("project:     %s (%s)\n", p["name"], p["acronym"])
-					} else {
-						fmt.Printf("ticket:      %s\n", display)
-					}
-					fmt.Printf("title:       %s\n", t["title"])
-					fmt.Printf("status:      %s\n", t["column"])
-					if au, ok := t["assigned_user"].(map[string]interface{}); ok {
-						fmt.Printf("assigned:    %s\n", au["username"])
-					} else {
-						fmt.Printf("assigned:    unassigned\n")
-					}
-					desc := ""
-					if d, ok := t["description"].(string); ok {
-						desc = d
-					}
-					if desc != "" {
-						fmt.Printf("description: %s\n", desc)
-					}
-					return nil
-				}
+			display := publicTicketID(t)
+			if p, ok := t["project"].(map[string]interface{}); ok {
+				fmt.Printf("ticket:      %s\n", display)
+				fmt.Printf("project:     %s (%s)\n", p["name"], p["acronym"])
+			} else {
+				fmt.Printf("ticket:      %s\n", display)
 			}
-			return fmt.Errorf("ticket not found")
+			fmt.Printf("title:       %s\n", t["title"])
+			fmt.Printf("status:      %s\n", t["column"])
+			if au, ok := t["assigned_user"].(map[string]interface{}); ok {
+				fmt.Printf("assigned:    %s\n", au["username"])
+			} else {
+				fmt.Printf("assigned:    unassigned\n")
+			}
+			desc := ""
+			if d, ok := t["description"].(string); ok {
+				desc = d
+			}
+			if desc != "" {
+				fmt.Printf("description: %s\n", desc)
+			}
+			return nil
+		},
+	}
+
+	// --- assign ---
+	assignCmd := &cobra.Command{
+		Use:   "assign [id] [username]",
+		Short: "assign a ticket to a user",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			dbID, display, err := resolveTicket(args[0])
+			if err != nil {
+				return err
+			}
+
+			ticket, err := getTicketByID(dbID)
+			if err != nil {
+				return err
+			}
+
+			project, ok := ticket["project"].(map[string]interface{})
+			if !ok {
+				return fmt.Errorf("ticket project not found")
+			}
+
+			projectID := int(project["id"].(float64))
+			userID, username, err := resolveProjectUserID(projectID, args[1])
+			if err != nil {
+				return err
+			}
+
+			path := fmt.Sprintf("/api/tickets/%d", dbID)
+			_, err = apiRequest("PATCH", path, map[string]int{"assigned_user_id": userID})
+			if err != nil {
+				return err
+			}
+
+			fmt.Printf("%s assigned to %s\n", display, username)
+			return nil
+		},
+	}
+
+	// --- unassign ---
+	unassignCmd := &cobra.Command{
+		Use:   "unassign [id]",
+		Short: "remove ticket assignment",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			dbID, display, err := resolveTicket(args[0])
+			if err != nil {
+				return err
+			}
+
+			path := fmt.Sprintf("/api/tickets/%d", dbID)
+			_, err = apiRequest("PATCH", path, map[string]int{"assigned_user_id": 0})
+			if err != nil {
+				return err
+			}
+
+			fmt.Printf("%s unassigned\n", display)
+			return nil
+		},
+	}
+
+	// --- edit ---
+	editCmd := &cobra.Command{
+		Use:   "edit [id]",
+		Short: "edit an existing ticket",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			dbID, display, err := resolveTicket(args[0])
+			if err != nil {
+				return err
+			}
+
+			title, _ := cmd.Flags().GetString("title")
+			desc, _ := cmd.Flags().GetString("desc")
+			clearDesc, _ := cmd.Flags().GetBool("clear-desc")
+
+			body := map[string]interface{}{}
+
+			if cmd.Flags().Changed("title") {
+				body["title"] = title
+			}
+			if cmd.Flags().Changed("desc") {
+				body["description"] = desc
+			}
+			if clearDesc {
+				body["description"] = ""
+			}
+
+			if len(body) == 0 {
+				return fmt.Errorf("nothing to edit")
+			}
+
+			path := fmt.Sprintf("/api/tickets/%d", dbID)
+			_, err = apiRequest("PATCH", path, body)
+			if err != nil {
+				return err
+			}
+
+			fmt.Printf("updated %s\n", display)
+			return nil
+		},
+	}
+	editCmd.Flags().String("title", "", "new ticket title")
+	editCmd.Flags().String("desc", "", "new ticket description")
+	editCmd.Flags().Bool("clear-desc", false, "clear ticket description")
+
+	// --- delete ---
+	deleteCmd := &cobra.Command{
+		Use:   "delete [id]",
+		Short: "delete a ticket",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			dbID, display, err := resolveTicket(args[0])
+			if err != nil {
+				return err
+			}
+
+			path := fmt.Sprintf("/api/tickets/%d", dbID)
+			_, err = apiRequest("DELETE", path, nil)
+			if err != nil {
+				return err
+			}
+
+			fmt.Printf("deleted %s\n", display)
+			return nil
 		},
 	}
 
 	// --- move ---
 	moveCmd := &cobra.Command{
 		Use:   "move [id] [status]",
-		Short: "update ticket status (accepts TST-1 or db id)",
+		Short: "update ticket status",
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			dbID, display, err := resolveTicket(args[0])
@@ -375,8 +634,7 @@ func main() {
 				return err
 			}
 			column := strings.ToLower(args[1])
-			valid := map[string]bool{"todo": true, "inprogress": true, "testing": true, "done": true}
-			if !valid[column] {
+			if !isValidStatus(column) {
 				return fmt.Errorf("invalid status: %s (use: todo, inprogress, testing, done)", column)
 			}
 
@@ -403,26 +661,12 @@ func main() {
 				return fmt.Errorf("--project is required")
 			}
 
-			// resolve project code to id
-			projects, err := apiRequest("GET", "/api/projects", nil)
+			projectID, _, _, err := resolveProjectID(project)
 			if err != nil {
 				return err
 			}
-			var projectList []map[string]interface{}
-			json.Unmarshal(projects, &projectList)
 
-			var projectID float64
-			for _, p := range projectList {
-				if strings.EqualFold(p["acronym"].(string), project) {
-					projectID = p["id"].(float64)
-					break
-				}
-			}
-			if projectID == 0 {
-				return fmt.Errorf("project '%s' not found", project)
-			}
-
-			path := fmt.Sprintf("/api/tickets?project_id=%.0f", projectID)
+			path := fmt.Sprintf("/api/tickets?project_id=%d", projectID)
 			body := map[string]string{"title": args[0]}
 			if desc != "" {
 				body["description"] = desc
@@ -435,14 +679,18 @@ func main() {
 
 			var ticket map[string]interface{}
 			json.Unmarshal(data, &ticket)
-			fmt.Printf("created ticket %.0f: %s\n", ticket["id"].(float64), ticket["title"])
+			display := publicTicketID(ticket)
+			if display == "" {
+				return fmt.Errorf("ticket created, but public ticket id was not returned")
+			}
+			fmt.Printf("created %s: %s\n", display, ticket["title"])
 			return nil
 		},
 	}
-	newCmd.Flags().StringP("project", "p", "", "project code (required)")
+	newCmd.Flags().StringP("project", "p", "", "project code or name (required)")
 	newCmd.Flags().StringP("desc", "d", "", "description")
 	newCmd.MarkFlagRequired("project")
 
-	root.AddCommand(loginCmd, logoutCmd, whoamiCmd, projectsCmd, ticketsCmd, ticketCmd, moveCmd, newCmd)
+	root.AddCommand(loginCmd, logoutCmd, whoamiCmd, projectsCmd, ticketsCmd, ticketCmd, assignCmd, unassignCmd, editCmd, deleteCmd, moveCmd, newCmd)
 	root.Execute()
 }
